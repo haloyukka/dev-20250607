@@ -1,0 +1,31 @@
+# テスト用 requirements.txt
+# Mock環境での動作確認用（Google Cloudライブラリなしでも動作）
+
+# Data Processing
+pandas==2.1.3
+numpy==1.24.4
+
+# Utilities
+pytz==2023.3
+python-dateutil==2.8.2
+
+# Optional: Google Cloud Libraries (Mockで動作するため必須ではない)
+# google-cloud-bigquery==3.11.4
+# google-cloud-storage==2.10.0
+
+# Optional: Database Libraries (Mockで動作するため必須ではない)
+# SQLAlchemy==2.0.23
+# pyodbc==4.0.39
+
+# Development/Testing
+pytest==7.4.3
+pytest-mock==3.12.0
+
+# Logging (標準ライブラリなので不要だが、明示的に記載)
+# logging - built-in
+
+# JSON処理 (標準ライブラリなので不要だが、明示的に記載)
+# json - built-in
+
+# Random (標準ライブラリなので不要だが、明示的に記載)
+# random - built-in
