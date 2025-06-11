@@ -1,20 +1,18 @@
 import os
-import logging
 import csv
 import io
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 import pytz
-import pandas as pd
-import sqlalchemy
-from sqlalchemy import text, inspect
+import pymssql
 from google.cloud import bigquery
 from google.cloud import storage
 from google.cloud.sql.connector import Connector
+from google.cloud import logging
 
-# ログ設定
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Cloud Logging設定
+logging_client = logging.Client()
+logging_client.setup_logging()
 
 # JST タイムゾーン
 JST = pytz.timezone('Asia/Tokyo')
@@ -46,43 +44,41 @@ class DataSyncManager:
         self.config = config
         self.bigquery_client = bigquery.Client(project=config.bigquery_project)
         self.storage_client = storage.Client()
-        self.sql_engine = None
+        self.db_conn = None
+        self.logger = logging_client.logger('data_sync')
         
-    def create_sql_engine(self) -> sqlalchemy.engine.Engine:
-        """SQL Server接続エンジンを作成"""
+    def create_db_connection(self) -> pymssql.Connection:
+        """SQL Server接続を作成"""
         try:
-            # SQL Server接続文字列を構築
-            connection_string = (
-                f"mssql+pyodbc://{self.config.sql_server_user}:"
-                f"{self.config.sql_server_password}@"
-                f"{self.config.sql_server_host}:{self.config.sql_server_port}/"
-                f"{self.config.sql_server_database}?"
-                f"driver=ODBC+Driver+17+for+SQL+Server&"
-                f"TrustServerCertificate=yes"
+            conn = pymssql.connect(
+                server=self.config.sql_server_host,
+                port=int(self.config.sql_server_port),
+                user=self.config.sql_server_user,
+                password=self.config.sql_server_password,
+                database=self.config.sql_server_database
             )
             
-            engine = sqlalchemy.create_engine(
-                connection_string,
-                pool_pre_ping=True,
-                pool_recycle=300,
-                echo=False
-            )
-            
-            logger.info("SQL Server接続エンジンを作成しました")
-            return engine
+            self.logger.log_text("SQL Server接続を作成しました", severity="INFO")
+            return conn
             
         except Exception as e:
-            logger.error(f"SQL Server接続エンジン作成エラー: {e}")
+            self.logger.log_text(f"SQL Server接続作成エラー: {e}", severity="ERROR")
             raise
 
     def get_table_columns(self, table_name: str) -> List[str]:
         """テーブルのカラム一覧を取得"""
         try:
-            inspector = inspect(self.sql_engine)
-            columns = inspector.get_columns(table_name)
-            return [col['name'] for col in columns]
+            if not self.db_conn:
+                raise ValueError("データベース接続が初期化されていません")
+
+            cursor = self.db_conn.cursor()
+            cursor.execute(f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}'")
+            columns = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            return columns
+            
         except Exception as e:
-            logger.error(f"テーブル {table_name} のカラム取得エラー: {e}")
+            self.logger.log_text(f"テーブル {table_name} のカラム取得エラー: {e}", severity="ERROR")
             raise
 
     def get_last_sync_time(self, table_name: str) -> Optional[datetime]:
@@ -109,7 +105,7 @@ class DataSyncManager:
             return None
             
         except Exception as e:
-            logger.warning(f"前回同期時刻取得エラー (テーブル: {table_name}): {e}")
+            self.logger.log_text(f"前回同期時刻取得エラー (テーブル: {table_name}): {e}", severity="WARNING")
             return None
 
     def update_sync_metadata(self, table_name: str, max_timestamp: Optional[datetime]):
@@ -148,10 +144,10 @@ class DataSyncManager:
             )
             
             self.bigquery_client.query(query, job_config=job_config).result()
-            logger.info(f"同期メタデータを更新しました: {table_name}")
+            self.logger.log_text(f"同期メタデータを更新しました: {table_name}", severity="INFO")
             
         except Exception as e:
-            logger.error(f"同期メタデータ更新エラー: {e}")
+            self.logger.log_text(f"同期メタデータ更新エラー: {e}", severity="ERROR")
             raise
 
     def ensure_sync_metadata_table(self):
@@ -169,15 +165,20 @@ class DataSyncManager:
             table.clustering_fields = ["table_name"]
             
             self.bigquery_client.create_table(table, exists_ok=True)
-            logger.info("sync_metadataテーブルを確認/作成しました")
+            self.logger.log_text("sync_metadataテーブルを確認/作成しました", severity="INFO")
             
         except Exception as e:
-            logger.error(f"sync_metadataテーブル作成エラー: {e}")
+            self.logger.log_text(f"sync_metadataテーブル作成エラー: {e}", severity="ERROR")
             raise
 
-    def extract_data(self, table_name: str, timestamp_column: Optional[str]) -> pd.DataFrame:
+    def extract_data(self, table_name: str, timestamp_column: Optional[str]) -> List[Dict[str, Any]]:
         """SQL Serverからデータを抽出"""
         try:
+            if not self.db_conn:
+                raise ValueError("データベース接続が初期化されていません")
+
+            cursor = self.db_conn.cursor(as_dict=True)
+            
             if timestamp_column:
                 # タイムスタンプカラムがある場合は差分抽出
                 last_sync = self.get_last_sync_time(table_name)
@@ -185,33 +186,37 @@ class DataSyncManager:
                 if last_sync:
                     query = f"""
                     SELECT * FROM {table_name}
-                    WHERE {timestamp_column} > ?
+                    WHERE {timestamp_column} > %s
                     ORDER BY {timestamp_column}
                     """
-                    df = pd.read_sql(query, self.sql_engine, params=[last_sync])
-                    logger.info(f"差分データを抽出しました: {table_name} ({len(df)}件)")
+                    cursor.execute(query, (last_sync,))
+                    data = cursor.fetchall()
+                    self.logger.log_text(f"差分データを抽出しました: {table_name} ({len(data)}件)", severity="INFO")
                 else:
                     query = f"SELECT * FROM {table_name} ORDER BY {timestamp_column}"
-                    df = pd.read_sql(query, self.sql_engine)
-                    logger.info(f"初回全件データを抽出しました: {table_name} ({len(df)}件)")
+                    cursor.execute(query)
+                    data = cursor.fetchall()
+                    self.logger.log_text(f"初回全件データを抽出しました: {table_name} ({len(data)}件)", severity="INFO")
             else:
                 # タイムスタンプカラムがない場合は全件抽出
                 query = f"SELECT * FROM {table_name}"
-                df = pd.read_sql(query, self.sql_engine)
-                logger.info(f"全件データを抽出しました: {table_name} ({len(df)}件)")
-                
-            return df
+                cursor.execute(query)
+                data = cursor.fetchall()
+                self.logger.log_text(f"全件データを抽出しました: {table_name} ({len(data)}件)", severity="INFO")
+            
+            cursor.close()
+            return data
             
         except Exception as e:
-            logger.error(f"データ抽出エラー (テーブル: {table_name}): {e}")
+            self.logger.log_text(f"データ抽出エラー (テーブル: {table_name}): {e}", severity="ERROR")
             raise
 
-    def save_to_gcs(self, df: pd.DataFrame, table_name: str) -> str:
+    def save_to_gcs(self, data: List[Dict[str, Any]], table_name: str) -> str:
         """データをCSVとしてGCSに保存"""
         try:
-            if df.empty:
-                logger.info(f"データが空のため、GCSへの保存をスキップします: {table_name}")
-                return None
+            if not data:
+                self.logger.log_text(f"データが空のため、GCSへの保存をスキップします: {table_name}", severity="INFO")
+                return ""
                 
             # JST タイムスタンプ付きファイル名
             now_jst = datetime.now(JST)
@@ -219,101 +224,100 @@ class DataSyncManager:
             
             # CSVデータをメモリ上で作成
             csv_buffer = io.StringIO()
-            df.to_csv(csv_buffer, index=False, encoding='utf-8')
-            csv_content = csv_buffer.getvalue()
+            if data:
+                writer = csv.DictWriter(csv_buffer, fieldnames=data[0].keys())
+                writer.writeheader()
+                writer.writerows(data)
             
             # GCSにアップロード
             bucket = self.storage_client.bucket(self.config.gcs_bucket)
             blob = bucket.blob(filename)
-            blob.upload_from_string(csv_content, content_type='text/csv')
+            blob.upload_from_string(csv_buffer.getvalue(), content_type='text/csv')
             
-            logger.info(f"CSVファイルをGCSに保存しました: gs://{self.config.gcs_bucket}/{filename}")
+            self.logger.log_text(f"CSVファイルをGCSに保存しました: gs://{self.config.gcs_bucket}/{filename}", severity="INFO")
             return filename
             
         except Exception as e:
-            logger.error(f"GCS保存エラー: {e}")
+            self.logger.log_text(f"GCS保存エラー: {e}", severity="ERROR")
             raise
 
-    def get_max_timestamp(self, df: pd.DataFrame, timestamp_column: str) -> Optional[datetime]:
-        """データフレームから最大タイムスタンプを取得"""
+    def get_max_timestamp(self, data: List[Dict[str, Any]], timestamp_column: str) -> Optional[datetime]:
+        """データから最大タイムスタンプを取得"""
         try:
-            if df.empty or timestamp_column not in df.columns:
+            if not data or timestamp_column not in data[0]:
                 return None
                 
-            max_ts = df[timestamp_column].max()
+            max_ts = max(row[timestamp_column] for row in data if row[timestamp_column] is not None)
             
-            # pandas Timestampをdatetimeに変換
-            if pd.isna(max_ts):
+            if max_ts is None:
                 return None
                 
-            if isinstance(max_ts, pd.Timestamp):
-                return max_ts.to_pydatetime()
-            elif isinstance(max_ts, datetime):
+            if isinstance(max_ts, datetime):
                 return max_ts
             else:
-                return pd.to_datetime(max_ts).to_pydatetime()
+                return datetime.fromisoformat(str(max_ts))
                 
         except Exception as e:
-            logger.error(f"最大タイムスタンプ取得エラー: {e}")
+            self.logger.log_text(f"最大タイムスタンプ取得エラー: {e}", severity="ERROR")
             return None
 
     def sync_table(self, table_name: str, table_config: Dict[str, Any]):
         """単一テーブルの同期を実行"""
         try:
-            logger.info(f"テーブル同期開始: {table_name}")
+            self.logger.log_text(f"テーブル同期開始: {table_name}", severity="INFO")
             
             timestamp_column = table_config.get('timestamp_column')
             
             # データ抽出
-            df = self.extract_data(table_name, timestamp_column)
+            data = self.extract_data(table_name, timestamp_column)
             
-            if df.empty:
-                logger.info(f"同期対象データなし: {table_name}")
+            if not data:
+                self.logger.log_text(f"同期対象データなし: {table_name}", severity="INFO")
                 return
             
             # GCSに保存
-            gcs_filename = self.save_to_gcs(df, table_name)
+            gcs_filename = self.save_to_gcs(data, table_name)
             
             # 最大タイムスタンプを取得
             max_timestamp = None
             if timestamp_column:
-                max_timestamp = self.get_max_timestamp(df, timestamp_column)
+                max_timestamp = self.get_max_timestamp(data, timestamp_column)
             
             # 同期メタデータを更新
             self.update_sync_metadata(table_name, max_timestamp)
             
-            logger.info(f"テーブル同期完了: {table_name} (ファイル: {gcs_filename})")
+            self.logger.log_text(f"テーブル同期完了: {table_name} (ファイル: {gcs_filename})", severity="INFO")
             
         except Exception as e:
-            logger.error(f"テーブル同期エラー: {table_name} - {e}")
+            self.logger.log_text(f"テーブル同期エラー: {table_name} - {e}", severity="ERROR")
             raise
 
     def run_sync(self):
         """全体の同期プロセスを実行"""
         try:
-            logger.info("データ同期処理を開始します")
+            self.logger.log_text("データ同期処理を開始します", severity="INFO")
             
             # SQL Server接続
-            self.sql_engine = self.create_sql_engine()
+            self.db_conn = self.create_db_connection()
             
             # 各テーブルを同期
             for table_name, table_config in self.config.sync_tables.items():
                 try:
                     self.sync_table(table_name, table_config)
                 except Exception as e:
-                    logger.error(f"テーブル {table_name} の同期でエラーが発生しました: {e}")
+                    self.logger.log_text(f"テーブル {table_name} の同期でエラーが発生しました: {e}", severity="ERROR")
                     # 他のテーブルの同期は続行
                     continue
             
-            logger.info("データ同期処理が完了しました")
+            self.logger.log_text("データ同期処理が完了しました", severity="INFO")
             
         except Exception as e:
-            logger.error(f"データ同期処理でエラーが発生しました: {e}")
+            self.logger.log_text(f"データ同期処理でエラーが発生しました: {e}", severity="ERROR")
             raise
         finally:
             # リソースクリーンアップ
-            if self.sql_engine:
-                self.sql_engine.dispose()
+            if self.db_conn:
+                self.db_conn.close()
 
 def main(request):
     """Cloud Function エントリーポイント"""
@@ -328,7 +332,8 @@ def main(request):
         return {"status": "success", "message": "データ同期が正常に完了しました"}
         
     except Exception as e:
-        logger.error(f"Cloud Function実行エラー: {e}")
+        logger = logging_client.logger('data_sync')
+        logger.log_text(f"Cloud Function実行エラー: {e}", severity="ERROR")
         return {"status": "error", "message": str(e)}, 500
 
 if __name__ == "__main__":
